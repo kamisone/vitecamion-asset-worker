@@ -1,4 +1,4 @@
-name: CI - PREPROD-BACK
+name: CI - PREPROD-ASSET-WORKER
 on:
   push:
     branches: [dev]
@@ -16,18 +16,18 @@ jobs:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
           password: ${{ secrets.DOCKER_HUB_PASSWORD }}
 
-      - name: build back
+      - name: build asset worker
         run: |
           npm i
           npm run build
-      - name: build back image
-        run: docker build -t mo29172/lghorba_back:v${{ github.run_number }} -f docker/back/Dockerfile .
-      - name: push back image to docker hub
+      - name: build asset-worker image
+        run: docker build -t mo29172/lghorba_asset_worker:v${{ github.run_number }} -f docker/worker/Dockerfile .
+      - name: push asset-worker image to docker hub
         run: |
-          docker push mo29172/lghorba_back:v${{ github.run_number }}
-      - name: update back deployment file version
+          docker push mo29172/lghorba_asset_worker:v${{ github.run_number }}
+      - name: update asset-worker deployment file version
         run: |
-          sed -i -e"s/:latest/:v${{ github.run_number }}/" docker/k8s/back-deployment.yaml
+          sed -i -e"s/:latest/:v${{ github.run_number }}/" docker/k8s/asset-worker-deployment.yaml
 
 
       - name: copy k8s files via ssh
@@ -36,19 +36,8 @@ jobs:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
-          source: 'docker/k8s/back-deployment.yaml,docker/k8s/back-hpa.yaml,docker/k8s/back-cluster-ip-service.yaml,docker/k8s/back-ingress-service.yaml,docker/k8s/db-deployment.yaml,docker/k8s/db-persistent-volume-claim.yaml,docker/k8s/db-cluster-ip-service.yaml,docker/k8s/redis-deployment.yaml,docker/k8s/redis-persistent-volume-claim.yaml,docker/k8s/redist-cluster-ip-service.yaml,'
-          target: '/srv/k8s/back'
-          strip_components: 2
-          timeout: 5m
-
-      - name: copy nginx file via ssh
-        uses: appleboy/scp-action@master
-        with:
-          host: ${{ secrets.SERVER_HOST }}
-          username: ${{ secrets.SERVER_USER }}
-          key: ${{ secrets.SERVER_SSH_KEY }}
-          source: 'docker/nginx/default.conf'
-          target: '/etc/nginx/conf.d'
+          source: 'docker/k8s/asset-worker-cluster-ip-service.yaml,docker/k8s/asset-worker-deployment.yaml,docker/k8s/asset-worker-hpa.yaml,'
+          target: '/srv/k8s/asset-worker'
           strip_components: 2
           timeout: 5m
 
@@ -59,10 +48,9 @@ jobs:
           username: ${{ secrets.SERVER_SECOND_USER }}
           password: ${{ secrets.SERVER_SECOND_USER_PASSWORD }}
           script: |
-            kubectl delete secret back-envs --ignore-not-found=true
-            kubectl create secret generic back-envs \
+            kubectl delete secret asset-worker-envs --ignore-not-found=true
+            kubectl create secret generic asset-worker-envs \
             --from-literal NODE_ENV=${{ secrets.NODE_ENV }} \
-            --from-literal ALLOWED_ORIGINS=${{ secrets.ALLOWED_ORIGINS }} \
             --from-literal APP_URL=${{ secrets.APP_URL }} \
             --from-literal BACK_PORT=${{ secrets.BACK_PORT }} \
             --from-literal TYPEORM_HOST=${{ secrets.TYPEORM_HOST }} \
@@ -70,10 +58,6 @@ jobs:
             --from-literal TYPEORM_USERNAME=${{ secrets.TYPEORM_USERNAME }} \
             --from-literal TYPEORM_PASSWORD=${{ secrets.TYPEORM_PASSWORD }} \
             --from-literal TYPEORM_DATABASE=${{ secrets.TYPEORM_DATABASE }} \
-            --from-literal JWT_SECRET=${{ secrets.JWT_SECRET }} \
-            --from-literal JWT_REFRESH_SECRET=${{ secrets.JWT_REFRESH_SECRET }} \
-            --from-literal ADMIN_EMAIL=${{ secrets.ADMIN_EMAIL }} \
-            --from-literal ADMIN_PASSWORD=${{ secrets.ADMIN_PASSWORD }} \
             --from-literal GCS_BUCKET_NAME=${{ secrets.GCS_BUCKET_NAME }} \
             --from-literal GCS_PROJECT_ID=${{ secrets.GCS_PROJECT_ID }} \
             --from-literal GCS_CLIENT_EMAIL=${{ secrets.GCS_CLIENT_EMAIL }} \
@@ -82,28 +66,8 @@ jobs:
             --from-literal REDIS_HOST=${{ secrets.REDIS_HOST }} \
             --from-literal REDIS_PORT=${{ secrets.REDIS_PORT }} \
             --from-literal REDIS_PASSWORD=${{ secrets.REDIS_PASSWORD }} \
-            --from-literal REDIS_DB=${{ secrets.REDIS_DB }} \
-            --from-literal STRIPE_SECRET_KEY=${{ secrets.STRIPE_SECRET_KEY }} \
-            --from-literal STRIPE_WEBHOOK_SECRET=${{ secrets.STRIPE_WEBHOOK_SECRET }} \
-            --from-literal STRIPE_SHOP_WEBHOOK_SECRET=${{ secrets.STRIPE_SHOP_WEBHOOK_SECRET }} \
-            --from-literal SELLER_NAME=${{ secrets.SELLER_NAME }} \
-            --from-literal SELLER_ADDRESS_LINE1=${{ secrets.SELLER_ADDRESS_LINE1 }} \
-            --from-literal SELLER_ADDRESS_CITY=${{ secrets.SELLER_ADDRESS_CITY }} \
-            --from-literal SELLER_ADDRESS_ZIP=${{ secrets.SELLER_ADDRESS_ZIP }} \
-            --from-literal SELLER_ADDRESS_COUNTRY=${{ secrets.SELLER_ADDRESS_COUNTRY }} \
-            --from-literal SELLER_VAT_NUMBER=${{ secrets.SELLER_VAT_NUMBER }} \
-            --from-literal SELLER_SIRET=${{ secrets.SELLER_SIRET }} \
-            --from-literal SMTP_HOST=${{ secrets.SMTP_HOST }} \
-            --from-literal SMTP_PORT=${{ secrets.SMTP_PORT }} \
-            --from-literal SMTP_USER=${{ secrets.SMTP_USER }} \
-            --from-literal SMTP_PASS=${{ secrets.SMTP_PASS }} \
-            --from-literal SMTP_FROM=${{ secrets.SMTP_FROM }} \
-            --from-literal IMAP_HOST=${{ secrets.IMAP_HOST }} \
-            --from-literal IMAP_PORT=${{ secrets.IMAP_PORT }} \
-            --from-literal IMAP_USER=${{ secrets.IMAP_USER }} \
-            --from-literal IMAP_PASSWORD=${{ secrets.IMAP_PASSWORD }} \
-            --from-literal TURNSTILE_SECRET_KEY=${{ secrets.TURNSTILE_SECRET_KEY }}
-            kubectl apply -f /srv/k8s/back
+            --from-literal REDIS_DB=${{ secrets.REDIS_DB }}
+            kubectl apply -f /srv/k8s/asset-worker
             minikube addons enable ingress
             echo ${{ secrets.SERVER_SECOND_USER_PASSWORD }} | sudo -S systemctl restart nginx
             echo y | docker exec -i minikube docker system prune -a --volumes

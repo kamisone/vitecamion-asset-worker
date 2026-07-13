@@ -1,0 +1,112 @@
+import { Injectable, Logger } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { InjectQueue } from '@nestjs/bullmq';
+import { Queue } from 'bullmq';
+import * as crypto from 'crypto';
+import { Repository } from 'typeorm';
+import { GcsService } from '../gcs/gcs.service';
+import { MediaAsset } from './media-asset.entity';
+import { extractImageDimensions, extractVideoMetadata } from './media-metadata.util';
+import { TRANSCODE_JOB, TranscodeJobData, VIDEO_TRANSCODE_QUEUE } from './video-transcode.constants';
+
+export type MediaKind = 'image' | 'video' | 'other';
+
+export function getMediaKind(mimeType: string): MediaKind {
+  if (mimeType.startsWith('image/')) return 'image';
+  if (mimeType.startsWith('video/')) return 'video';
+  return 'other';
+}
+
+/** "photo.jpg" + webp/q75 → "photo-webp-q75.webp"; same-format → "photo-q75.jpg" */
+export function buildConvertedFilename(original: string, targetExt: string, quality: number, formatChanged: boolean): string {
+  const base = original.replace(/\.[^.]+$/, '') || original;
+  return formatChanged
+    ? `${base}-${targetExt}-q${quality}.${targetExt}`
+    : `${base}-q${quality}.${targetExt}`;
+}
+
+export interface ProcessedFile {
+  buffer: Buffer;
+  originalFilename: string;
+  mimeType: string;
+}
+
+const MEDIA_PREFIX = 'media/';
+
+/**
+ * Persists a processing OUTPUT (a converted image or video) as a brand-new
+ * media asset — exactly the same checksum-dedup + GCS-write + row-insert
+ * logic as back's MediaService.upload(), trimmed of the two things only the
+ * API needs: HEIC/MOV normalization (inputs here are already produced by our
+ * own ffmpeg/sharp pipeline, never raw camera formats) and signed-URL
+ * resolution (asset-worker never serves URLs, only writes rows; the API
+ * resolves URLs on read).
+ *
+ * Idempotent by design: re-running the same conversion produces identical
+ * bytes → identical checksum → the existing row is returned instead of a
+ * duplicate, so a retried BullMQ job can never create duplicate assets.
+ */
+@Injectable()
+export class AssetUploadService {
+  private readonly logger = new Logger(AssetUploadService.name);
+
+  constructor(
+    @InjectRepository(MediaAsset) private readonly assetRepo: Repository<MediaAsset>,
+    private readonly gcs: GcsService,
+    @InjectQueue(VIDEO_TRANSCODE_QUEUE) private readonly transcodeQueue: Queue<TranscodeJobData>,
+  ) {}
+
+  async saveProcessedAsset(
+    file: ProcessedFile,
+    opts: { altText?: string | null; uploadedBy?: string | null; folderId?: string | null } = {},
+  ): Promise<MediaAsset> {
+    const kind = getMediaKind(file.mimeType);
+    const checksum = crypto.createHash('sha256').update(new Uint8Array(file.buffer)).digest('hex');
+
+    const existing = await this.assetRepo.findOne({ where: { checksum } });
+    if (existing) {
+      this.logger.log(`Dedup hit for ${file.originalFilename} → reusing asset ${existing.id}`);
+      return existing;
+    }
+
+    const ext        = file.originalFilename.split('.').pop()?.toLowerCase() ?? 'bin';
+    const datePart   = new Date().toISOString().slice(0, 7);
+    const storageKey = `${MEDIA_PREFIX}${datePart}/${checksum.slice(0, 8)}-${Date.now()}.${ext}`;
+
+    await this.gcs.upload(file.buffer, storageKey, file.mimeType, 'publicRead');
+
+    const { width, height, durationSeconds } = kind === 'video'
+      ? await extractVideoMetadata(file.buffer, file.mimeType)
+      : { ...(await extractImageDimensions(file.buffer, file.mimeType)), durationSeconds: null };
+
+    const asset = this.assetRepo.create({
+      storageKey,
+      originalFilename: file.originalFilename,
+      mimeType:         file.mimeType,
+      sizeBytes:        file.buffer.length,
+      width,
+      height,
+      durationSeconds,
+      altText:          opts.altText ?? null,
+      checksum,
+      uploadedBy:       opts.uploadedBy ?? null,
+      folderId:         opts.folderId ?? null,
+      tags:             [],
+      transcodeStatus:  kind === 'video' ? 'pending' : null,
+    });
+    await this.assetRepo.save(asset);
+
+    // A converted video is itself a new video asset — it gets its own HLS
+    // ladder, same as any freshly uploaded video.
+    if (kind === 'video') {
+      await this.transcodeQueue.add(TRANSCODE_JOB, { assetId: asset.id }, {
+        attempts: 2,
+        backoff: { type: 'exponential', delay: 30_000 },
+        removeOnComplete: true,
+        removeOnFail: false,
+      });
+    }
+
+    return asset;
+  }
+}

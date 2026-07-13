@@ -3,6 +3,10 @@ kind: Deployment
 metadata:
   name: asset-worker-deployment
 spec:
+  # No public Service/Ingress targets this Deployment (see the ClusterIP
+  # service — internal only, no ingress route). It consumes the
+  # `video-transcode` BullMQ queue and talks to Postgres/GCS; nothing calls it
+  # over HTTP except same-pod health/readiness probes.
   selector:
     matchLabels:
       component: asset-worker
@@ -11,16 +15,38 @@ spec:
       labels:
         component: asset-worker
     spec:
+      # Let an in-flight ffmpeg/sharp job finish releasing its BullMQ lock on
+      # SIGTERM (see main.ts's enableShutdownHooks()) before the pod is killed.
+      terminationGracePeriodSeconds: 60
       containers:
         - name: asset-worker-container
           image: mo29172/lghorba_asset_worker:latest
           ports:
             - containerPort: 4000
           resources:
+            # Memory limits matter as much as CPU: an unbounded encoder pod
+            # can destabilize the node the same way an unbounded API pod can.
             limits:
               cpu: 500m
+              memory: 1Gi
             requests:
               cpu: 200m
+              memory: 384Mi
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 4000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 4000
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
           env:
             - name: TZ
               value: UTC
@@ -109,5 +135,4 @@ spec:
                 secretKeyRef:
                   name: asset-worker-envs
                   key: REDIS_DB
-           
-            
+

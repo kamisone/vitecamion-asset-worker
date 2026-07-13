@@ -3,7 +3,7 @@ import { INestApplication } from '@nestjs/common';
 import * as request from 'supertest';
 import { AppModule } from './../src/app.module';
 
-describe('AppController (e2e)', () => {
+describe('HealthController (e2e)', () => {
   let app: INestApplication;
 
   beforeEach(async () => {
@@ -15,10 +15,21 @@ describe('AppController (e2e)', () => {
     await app.init();
   });
 
-  it('/ (GET)', () => {
+  afterEach(async () => {
+    await app.close();
+  });
+
+  it('/healthz (GET) is always ok, independent of DB/Redis', () => {
     return request(app.getHttpServer())
-      .get('/')
+      .get('/healthz')
       .expect(200)
-      .expect('Hello World!');
+      .expect({ status: 'ok' });
+  });
+
+  it('/readyz (GET) reports ready once DB + Redis are connected', () => {
+    return request(app.getHttpServer())
+      .get('/readyz')
+      .expect(200)
+      .expect({ status: 'ready' });
   });
 });

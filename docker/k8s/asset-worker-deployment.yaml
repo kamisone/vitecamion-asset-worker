@@ -24,13 +24,25 @@ spec:
           ports:
             - containerPort: 4000
           resources:
-            # Memory limits matter as much as CPU: an unbounded encoder pod
-            # can destabilize the node the same way an unbounded API pod can.
+            # Deliberately the tightest budget of the three app deployments.
+            # ffmpeg/sharp jobs are background work with no user waiting on
+            # a response — they must never contend with back/front for CPU.
+            #
+            # The REQUEST (not just the limit) is what matters here: K8s
+            # arbitrates CPU under node contention by request-based cgroup
+            # weight, not by limit. A request as low as back/front's (200m)
+            # gave this pod an equal claim to CPU during contention and was
+            # enough, in practice on this exact VPS, to starve the control
+            # plane (etcd/apiserver) when ffmpeg ran. A tiny request (50m)
+            # means the scheduler deprioritizes this pod the instant anything
+            # else wants the CPU it's using — it only gets to run at full
+            # speed when the node has spare cycles. The limit (300m) is the
+            # hard ceiling even when the node is otherwise idle.
             limits:
-              cpu: 500m
+              cpu: 300m
               memory: 1Gi
             requests:
-              cpu: 200m
+              cpu: 50m
               memory: 384Mi
           readinessProbe:
             httpGet:

@@ -8,8 +8,20 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: asset-worker-deployment
+  # Pinned to a single replica — deliberately not autoscaled.
+  # 1) CPU-Utilization% targets are measured against the pod's REQUEST
+  #    (50m in asset-worker-deployment.yaml); any real ffmpeg/sharp job uses
+  #    far more than that, so a percentage target would read as 200-600%+
+  #    and trigger aggressive, constant scale-out.
+  # 2) More replicas directly fights "the worker must be limited": each one
+  #    can run its own concurrent encode (BullMQ concurrency:1 per pod), so
+  #    2-3 replicas means 2-3 simultaneous ffmpeg/sharp jobs each claiming
+  #    their own CPU slice — multiplying exactly the contention risk the
+  #    tight per-pod request/limit exists to prevent.
+  # A deeper backlog just makes the "Processing" queue longer, which is the
+  # correct tradeoff on this hardware — see docker/k8s/asset-worker-deployment.yaml.
   minReplicas: 1
-  maxReplicas: 3
+  maxReplicas: 1
   metrics:
   - type: Resource
     resource:

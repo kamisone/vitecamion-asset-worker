@@ -46,6 +46,12 @@ config({ quiet: true });
           port:     Number(process.env.BULLMQ_REDIS_PORT ?? process.env.REDIS_PORT ?? 6379),
           password: process.env.BULLMQ_REDIS_PASSWORD ?? process.env.REDIS_PASSWORD ?? undefined,
           db:       Number(process.env.BULLMQ_REDIS_DB  ?? 1),
+          // BullMQ's own requirement, not optional: without this, ioredis's default
+          // per-command retry cap (20) races BullMQ's internal blocking-read/
+          // reconnection logic during a real outage (e.g. a DNS blip reaching
+          // Redis), producing spurious Worker 'error' events instead of a quiet
+          // reconnect once Redis is reachable again.
+          maxRetriesPerRequest: null,
         },
       }),
     }),

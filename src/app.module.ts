@@ -4,6 +4,7 @@ import { BullModule } from '@nestjs/bullmq';
 import { config } from 'dotenv';
 import { MediaAsset } from './media/media-asset.entity';
 import { ProcessingModule } from './media/processing.module';
+import { MetricsModule } from './metrics/metrics.module';
 import { HealthController } from './health/health.controller';
 
 // Must run before the @Module decorator below is evaluated: TypeOrmModule.forRoot()
@@ -12,7 +13,7 @@ import { HealthController } from './health/health.controller';
 // config() call. In Kubernetes this is a no-op (the container env is already
 // populated by kubelet before Node starts); for local dev via .env it's required
 // — matches the same fix already applied in back/src/app.module.ts.
-config();
+config({ quiet: true });
 
 @Module({
   imports: [
@@ -48,6 +49,7 @@ config();
         },
       }),
     }),
+    MetricsModule,
     ProcessingModule,
   ],
   controllers: [HealthController],

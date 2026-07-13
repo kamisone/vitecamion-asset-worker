@@ -41,9 +41,14 @@ spec:
             limits:
               cpu: 300m
               memory: 1Gi
+              # HLS transcode writes several renditions + segments to /tmp
+              # simultaneously (up to ~2-4x source size); bound it so a large
+              # video can't fill the node's disk and starve db/redis/other pods.
+              ephemeral-storage: 4Gi
             requests:
               cpu: 50m
               memory: 384Mi
+              ephemeral-storage: 512Mi
           readinessProbe:
             httpGet:
               path: /readyz
@@ -62,6 +67,24 @@ spec:
           env:
             - name: TZ
               value: UTC
+            # ── Configurable processing limits (plain values, not secret —
+            # tune per deployment without touching CI/secrets) ──────────────
+            # BullMQ concurrency: jobs processed in parallel BY THIS POD. Kept
+            # at 1 given the tight CPU budget above — raising this multiplies
+            # simultaneous ffmpeg/sharp processes competing for the same
+            # 300m limit, which directly fights "the worker must be limited".
+            - name: WORKER_CONCURRENCY
+              value: "1"
+            # ffmpeg's own internal encoder threads, independent of the pod's
+            # cgroup CPU limit — keeps a single job from requesting more
+            # threads than this pod can usefully schedule.
+            - name: FFMPEG_THREADS
+              value: "1"
+            # nice(1) value applied to every spawned ffmpeg process (0-19,
+            # higher = lower OS scheduling priority) so encodes always yield
+            # to this pod's own health/metrics HTTP handling.
+            - name: FFMPEG_NICENESS
+              value: "10"
             - name: NODE_ENV
               valueFrom:
                 secretKeyRef:

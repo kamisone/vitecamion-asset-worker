@@ -12,6 +12,7 @@ import { path as ffprobePath } from '@ffprobe-installer/ffprobe';
 import { DlqAwareWorker } from '../dlq/dlq-aware.worker';
 import { DlqService } from '../dlq/dlq.service';
 import { GcsService } from '../gcs/gcs.service';
+import { MetricsService } from '../metrics/metrics.service';
 import { MediaAsset } from './media-asset.entity';
 import { AssetUploadService, buildConvertedFilename } from './asset-upload.service';
 import { ImageConversionService } from './image-conversion.service';
@@ -67,11 +68,41 @@ export class VideoTranscodeProcessor extends DlqAwareWorker {
     private readonly gcs: GcsService,
     private readonly uploads: AssetUploadService,
     private readonly imageConversion: ImageConversionService,
+    private readonly metrics: MetricsService,
   ) {
     super(dlqService);
   }
 
+  /**
+   * Duration/outcome logging + Prometheus metrics for every job type in one
+   * place — structured log fields (jobId, jobName, assetId, durationMs) so
+   * `kubectl logs` is greppable, and the same data feeds /metrics
+   * (asset_worker_job_duration_seconds, asset_worker_jobs_total,
+   * asset_worker_active_jobs) for when a scraper is added.
+   */
   async process(job: Job): Promise<void> {
+    const startedAt = Date.now();
+    const assetId = (job.data as { assetId?: string }).assetId;
+    this.metrics.activeJobs.inc();
+    this.logger.log({ msg: 'job started', jobId: job.id, jobName: job.name, assetId });
+    try {
+      await this.dispatch(job);
+      const durationMs = Date.now() - startedAt;
+      this.logger.log({ msg: 'job completed', jobId: job.id, jobName: job.name, assetId, durationMs });
+      this.metrics.jobsTotal.inc({ jobName: job.name, outcome: 'success' });
+      this.metrics.jobDurationSeconds.observe({ jobName: job.name }, durationMs / 1000);
+    } catch (err) {
+      const durationMs = Date.now() - startedAt;
+      this.logger.error({ msg: 'job failed', jobId: job.id, jobName: job.name, assetId, durationMs, error: (err as Error).message });
+      this.metrics.jobsTotal.inc({ jobName: job.name, outcome: 'failure' });
+      this.metrics.jobDurationSeconds.observe({ jobName: job.name }, durationMs / 1000);
+      throw err; // preserve BullMQ retry/DLQ behavior — DlqAwareWorker still handles this
+    } finally {
+      this.metrics.activeJobs.dec();
+    }
+  }
+
+  private dispatch(job: Job): Promise<void> {
     if (job.name === CONVERT_VIDEO_JOB) return this.handleConvert(job as Job<ConvertVideoJobData>);
     if (job.name === CONVERT_IMAGE_JOB) {
       const { assetId, format, quality } = (job as Job<ConvertImageJobData>).data;
@@ -123,14 +154,17 @@ export class VideoTranscodeProcessor extends DlqAwareWorker {
       }
       await runFfmpeg(command.output(outPath));
 
-      const output = await fs.readFile(outPath);
       const filename = buildConvertedFilename(asset.originalFilename, targetExt, quality, targetExt !== sourceExt);
+      const { size: sizeBytes } = await fs.stat(outPath);
 
-      const created = await this.uploads.saveProcessedAsset(
-        { buffer: output, originalFilename: filename, mimeType: targetExt === 'webm' ? 'video/webm' : 'video/mp4' },
+      // Streamed from disk — never buffers the (potentially 100MB+) output
+      // into memory. See AssetUploadService.saveProcessedVideoFile.
+      const created = await this.uploads.saveProcessedVideoFile(
+        outPath,
+        { originalFilename: filename, mimeType: targetExt === 'webm' ? 'video/webm' : 'video/mp4', sizeBytes },
         { altText: asset.altText, uploadedBy: asset.uploadedBy, folderId: asset.folderId },
       );
-      this.logger.log(`Video convert done: ${asset.originalFilename} → ${created.originalFilename} (${(output.length / 1024 / 1024).toFixed(1)} MB)`);
+      this.logger.log(`Video convert done: ${asset.originalFilename} → ${created.originalFilename} (${(sizeBytes / 1024 / 1024).toFixed(1)} MB)`);
     } finally {
       await fs.rm(tmpDir, { recursive: true, force: true });
     }

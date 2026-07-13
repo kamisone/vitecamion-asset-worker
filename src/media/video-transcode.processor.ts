@@ -16,6 +16,7 @@ import { MetricsService } from '../metrics/metrics.service';
 import { MediaAsset } from './media-asset.entity';
 import { AssetUploadService, buildConvertedFilename } from './asset-upload.service';
 import { ImageConversionService } from './image-conversion.service';
+import { JobProgressReporter } from './job-progress';
 import {
   CONVERT_IMAGE_JOB, CONVERT_VIDEO_JOB, ConvertImageJobData, ConvertVideoJobData,
   TranscodeJobData, VIDEO_TRANSCODE_QUEUE,
@@ -124,6 +125,7 @@ export class VideoTranscodeProcessor extends DlqAwareWorker {
     const targetExt = format === 'original' ? sourceExt : format;
     // Scoped-per-job temp dir with guaranteed cleanup, even on failure.
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), `job-${job.id}-`));
+    const progress = new JobProgressReporter(job);
 
     try {
       const sourcePath = path.join(tmpDir, `source.${sourceExt}`);
@@ -152,7 +154,7 @@ export class VideoTranscodeProcessor extends DlqAwareWorker {
             '-movflags', '+faststart',
           ]);
       }
-      await runFfmpeg(command.output(outPath));
+      await runFfmpeg(command.output(outPath), percent => progress.report(percent));
 
       const filename = buildConvertedFilename(asset.originalFilename, targetExt, quality, targetExt !== sourceExt);
       const { size: sizeBytes } = await fs.stat(outPath);
@@ -187,6 +189,7 @@ export class VideoTranscodeProcessor extends DlqAwareWorker {
     // partial/duplicate state can accumulate from a retry.
     await this.assetRepo.update(asset.id, { transcodeStatus: 'processing' });
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), `job-${job.id}-`));
+    const progress = new JobProgressReporter(job);
 
     try {
       const sourcePath = path.join(tmpDir, `source${path.extname(asset.storageKey) || '.mp4'}`);
@@ -201,14 +204,19 @@ export class VideoTranscodeProcessor extends DlqAwareWorker {
       const outDir = path.join(tmpDir, 'out');
       await fs.mkdir(outDir);
 
-      for (const rung of rungs) {
-        await this.encodeHlsRendition(sourcePath, outDir, rung, hasAudio);
+      // Weighted equally across stages — see JobProgressReporter.reportStage.
+      const totalStages = rungs.length + 1; // + MP4 fallback (poster is near-instant, not counted)
+
+      for (const [i, rung] of rungs.entries()) {
+        await this.encodeHlsRendition(sourcePath, outDir, rung, hasAudio,
+          percent => progress.reportStage(i, totalStages, percent));
       }
       const masterName = 'master.m3u8';
       await fs.writeFile(path.join(outDir, masterName), buildMasterPlaylist(rungs, width, height), 'utf8');
 
       const mp4Name = 'fallback.mp4';
-      await this.encodeMp4Fallback(sourcePath, path.join(outDir, mp4Name), Math.min(height, 720), hasAudio);
+      await this.encodeMp4Fallback(sourcePath, path.join(outDir, mp4Name), Math.min(height, 720), hasAudio,
+        percent => progress.reportStage(rungs.length, totalStages, percent));
 
       const posterName = 'poster.jpg';
       await extractPoster(sourcePath, outDir, posterName, Math.min(duration / 2, 1));
@@ -243,6 +251,7 @@ export class VideoTranscodeProcessor extends DlqAwareWorker {
     outDir: string,
     rung: (typeof HLS_RUNGS)[number],
     hasAudio: boolean,
+    onProgress?: (percent: number) => void,
   ): Promise<void> {
     const name = `${rung.height}p`;
     return runFfmpeg(
@@ -267,10 +276,17 @@ export class VideoTranscodeProcessor extends DlqAwareWorker {
           '-hls_segment_filename', path.join(outDir, `${name}_%03d.m4s`),
         ])
         .output(path.join(outDir, `${name}.m3u8`)),
+      onProgress,
     );
   }
 
-  private encodeMp4Fallback(sourcePath: string, outPath: string, height: number, hasAudio: boolean): Promise<void> {
+  private encodeMp4Fallback(
+    sourcePath: string,
+    outPath: string,
+    height: number,
+    hasAudio: boolean,
+    onProgress?: (percent: number) => void,
+  ): Promise<void> {
     return runFfmpeg(
       niceFfmpeg(sourcePath)
         .videoCodec('libx264')
@@ -286,18 +302,31 @@ export class VideoTranscodeProcessor extends DlqAwareWorker {
           '-movflags', '+faststart',
         ])
         .output(outPath),
+      onProgress,
     );
   }
 }
 
 // ── ffmpeg helpers (pure, promise wrappers) ──────────────────────────────────
 
-function runFfmpeg(command: ffmpeg.FfmpegCommand): Promise<void> {
+function runFfmpeg(command: ffmpeg.FfmpegCommand, onProgress?: (percent: number) => void): Promise<void> {
   return new Promise((resolve, reject) => {
+    if (onProgress) {
+      // fluent-ffmpeg parses ffmpeg's stderr `time=` output against the
+      // probed duration; `percent` can be missing on the very first tick
+      // (before duration is known) or drift slightly past 100 near the end
+      // — the caller (JobProgressReporter) clamps, so pass raw values through.
+      command.on('progress', (data: { percent?: number }) => {
+        if (typeof data.percent === 'number') onProgress(data.percent);
+      });
+    }
     command
       .on('error', (err: Error, _stdout: string, stderr: string) =>
         reject(new Error(`ffmpeg failed: ${err.message}\n${(stderr ?? '').slice(-2000)}`)))
-      .on('end', () => resolve())
+      .on('end', () => {
+        onProgress?.(100);
+        resolve();
+      })
       .run();
   });
 }

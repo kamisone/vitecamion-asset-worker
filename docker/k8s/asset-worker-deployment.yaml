@@ -181,4 +181,23 @@ spec:
                 secretKeyRef:
                   name: asset-worker-envs
                   key: REDIS_DB
+          # os.tmpdir() (video-transcode.processor.ts) writes every job's source
+          # download + HLS renditions/segments/poster under /tmp. Without this
+          # mount, /tmp is just part of the container's root fs — on overlay2,
+          # every one of the many small HLS segment writes/renames pays
+          # copy-up/whiteout overhead in the storage driver, which under Minikube's
+          # nested virtualization showed up as runc itself stalling in D-state and
+          # >80% *system* CPU cluster-wide during a real transcode (see incident
+          # investigation). A dedicated emptyDir is a real filesystem (not the
+          # image's copy-on-write layer), removing that overhead. Disk-backed, not
+          # `medium: Memory` — this pod's 1Gi memory limit has no room to also
+          # hold HLS output (which the ephemeral-storage limit budgets up to 4Gi
+          # for) in RAM.
+          volumeMounts:
+            - name: worker-tmp
+              mountPath: /tmp
+      volumes:
+        - name: worker-tmp
+          emptyDir:
+            sizeLimit: 4Gi
 
